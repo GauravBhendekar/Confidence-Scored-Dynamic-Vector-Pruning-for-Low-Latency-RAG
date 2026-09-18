@@ -1,0 +1,52 @@
+pipeline: "qatm"
+
+retrieval:
+  candidate_pool_size: 15
+  min_relevance_score: 0.50
+
+classification:
+  enabled: true
+  confidence_threshold: 0.70
+  fallback_tier: 2
+
+tiers:
+  tier_1:
+    name: "factoid"
+    target_tokens: 100
+    min_tokens: 50
+    max_tokens: 200
+    retrieval_granularity: "micro_span"
+    min_items: 1
+    max_items: 2
+
+  tier_2:
+    name: "descriptive"
+    target_tokens: 450
+    min_tokens: 200
+    max_tokens: 700
+    retrieval_granularity: "standard"
+    min_items: 2
+    max_items: 4
+
+  tier_3:
+    name: "complex"
+    target_tokens: 900
+    min_tokens: 400
+    max_tokens: 1200
+    retrieval_granularity: "standard"
+    min_items: 3
+    max_items: 5
+
+pruning:
+  enabled: true
+  strategy: "gradient_knee"
+  gradient_threshold: 0.15
+  relative_drop_threshold: 0.25
+  absolute_min_score: 0.50
+
+trimming:
+  enabled: true
+  micro_span_sentence_limit: 2
+
+budget:
+  enabled: true

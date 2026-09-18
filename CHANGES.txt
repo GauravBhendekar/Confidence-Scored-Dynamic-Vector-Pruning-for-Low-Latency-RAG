@@ -1,0 +1,460 @@
+===============================================================================
+QATM-RAG — CHANGE LOG & REPRODUCTION REFERENCE
+===============================================================================
+Project : Query-Adaptive Token-Minimizing RAG (QATM-RAG)
+Location: D:\3 rd year\EDI
+Date    : 2026-09-18
+Session : Fixed Tier 3 token inflation + wired up real LLM benchmarking
+Status  : All changes verified. 9/9 unit tests passing. Real-LLM benchmark valid.
+===============================================================================
+
+
+===============================================================================
+SECTION 0 — TL;DR / QUICK REFERENCE
+===============================================================================
+
+WHAT WAS BROKEN
+  1. Tier 3 (complex) queries retrieved PARENT BLOCKS (~700 tok each) while the
+     baseline retrieved STANDARD chunks (~200 tok each). Result: complex queries
+     used MORE tokens than baseline -> NEGATIVE savings (-162% to -197%).
+     Mean savings across the benchmark was -39.5%.
+
+  2. No LLM was ever running. The provider silently fell back to a keyword
+     extraction stub, producing a bogus identical ~4,150 ms latency for both
+     pipelines. Answer quality could not be measured at all.
+
+  3. The first benchmark query absorbed ~62 s of model cold-start, inflating
+     baseline mean latency from ~4,900 ms to a false 14,012 ms.
+
+  4. Duplicate chunks: every paragraph is indexed at 3 granularities, so the
+     same text could occupy 2 of the 5 retained slots.
+
+  5. Flat score curves on complex (multi-hop) queries were clamped to min_k,
+     silently dropping needed facts.
+
+WHAT WAS FIXED
+  Fix 1  Tier 3 now retrieves STANDARD granularity; max_k capped at 5 (baseline k).
+  Fix 2  LLM provider rewritten: GGUF -> Ollama -> extractive fallback, with
+         honest backend reporting and warm_up().
+  Fix 3  Benchmark calls warm_up() before measuring; records llm_status.
+  Fix 4  Added _dedupe_by_text() in the QATM pipeline after retrieval.
+  Fix 5  Pruner detects flat distributions for Tier 3 and widens to max_k.
+
+RESULT (verified with llama3.2 via Ollama, 6 queries, warmed up)
+  Metric                    Baseline (k=5)    QATM-RAG      Change
+  Mean context tokens       289.83            232.0         -20.5%
+  Median context tokens     292.5             218.0         -25.4%
+  P95 context tokens        352.25            352.25        0%
+  Mean total latency        4,064 ms          3,744 ms      -7.9%
+  P95 total latency         5,276 ms          5,387 ms      +2.1%
+  Avg retained chunks       5.0               4.0           -1
+
+
+===============================================================================
+SECTION 1 — FILES CHANGED (COMPLETE LIST)
+===============================================================================
+
+CODE
+  [MODIFIED] src/generation/llama_cpp_provider.py     <- biggest change (Fix 2)
+  [MODIFIED] src/retrieval/qatm_pipeline.py           <- Fix 1 + Fix 4
+  [MODIFIED] src/pruning/gradient_pruner.py           <- Fix 1 + Fix 5
+  [MODIFIED] src/prompting/token_budget.py            <- Fix 1 (cap 1800->1200)
+  [MODIFIED] src/evaluation/evaluator.py              <- Fix 3
+
+CONFIG
+  [MODIFIED] configs/default_config.yaml              <- Ollama settings added
+  [MODIFIED] configs/qatm.yaml                        <- Tier 3 tier settings
+  [MODIFIED] requirements.txt                         <- added missing web/test deps
+
+ENTRY POINTS (config wiring only)
+  [MODIFIED] run_baseline.py
+  [MODIFIED] run_qatm.py
+  [MODIFIED] run_benchmark.py
+  [MODIFIED] app/main.py
+
+TESTS
+  [MODIFIED] tests/unit/test_pruning.py               <- 3 new Tier 3 tests
+
+DOCS
+  [REWRITTEN] PROJECT_STATUS.md
+  [REWRITTEN] docs/ARCHITECTURE.md
+  [MODIFIED]  docs/DATA_FLOW.md
+  [MODIFIED]  docs/METRICS.md
+  [MODIFIED]  README.md
+
+OUTPUT (regenerated, do not hand-edit)
+  [REGENERATED] results/benchmark_report.json
+
+
+===============================================================================
+SECTION 2 — EXACT CODE CHANGES
+===============================================================================
+
+-------------------------------------------------------------------------------
+2.1  src/generation/llama_cpp_provider.py
+-------------------------------------------------------------------------------
+
+ADDED at top:
+    import os          # was missing; needed for path checks / env vars
+
+ADDED class constants:
+    DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+    DEFAULT_OLLAMA_MODEL = "llama3.2"
+
+REPLACED __init__ signature — now accepts:
+    model_path, n_ctx, n_gpu_layers,
+    ollama_model=None, ollama_host=None, prefer_ollama=False, request_timeout=120.0
+
+NEW BACKEND RESOLUTION ORDER in __init__:
+    1. _try_load_llama_cpp()      -> only if a GGUF file actually exists
+    2. _ollama_available()        -> probe GET /api/tags, verify model is pulled
+    3. extractive fallback        -> logs a loud WARNING
+
+NEW METHODS ADDED:
+    _try_load_llama_cpp()   - checks os.path.exists before importing llama_cpp
+    _ollama_available()     - probes /api/tags; matches model name ignoring the
+                              ":latest" tag suffix; warns if model not pulled
+    warm_up()               - runs one throwaway generation (max_tokens=8,
+                              temperature=0.0) so the model is in memory before
+                              benchmarking. Returns True if a real backend warmed.
+
+NEW PROPERTIES ADDED:
+    provider_name  -> "llama_cpp (file.gguf)" | "ollama (llama3.2:latest)"
+                      | "extractive_fallback (no LLM)"
+    is_real_llm    -> True only for llama_cpp / ollama
+
+CHANGED generate():
+    - Ollama branch now calls _ollama_generate(...) (renamed from
+      _try_ollama_generate) and passes max_tokens + temperature.
+    - Return dict now includes:  "backend" and "is_real_llm".
+
+CHANGED _ollama_generate():  (was _try_ollama_generate)
+    - Uses self.ollama_model instead of hardcoded "llama3.2"
+    - Uses self.ollama_host instead of hardcoded localhost URL
+    - Adds options: {"temperature": ..., "num_predict": max_tokens}
+    - timeout now self.request_timeout (120s) instead of 3s
+      ^ CRITICAL: the old 3s timeout guaranteed real generation would fail
+    - Returns None on failure so the caller can report a per-call degrade
+
+CHANGED health_check():
+    OLD: return self.llm is not None      (True even in fallback mode!)
+    NEW: return self.is_real_llm
+
+-------------------------------------------------------------------------------
+2.2  src/retrieval/qatm_pipeline.py
+-------------------------------------------------------------------------------
+
+CHANGED Step 1 granularity mapping — BEFORE:
+    if tier == QueryTier.TIER_1_FACTOID:
+        granularity = Granularity.MICRO_SPAN
+    elif tier == QueryTier.TIER_3_COMPLEX:
+        granularity = Granularity.PARENT_BLOCK      # <-- THE BUG
+    else:
+        granularity = Granularity.STANDARD
+
+AFTER:
+    if tier == QueryTier.TIER_1_FACTOID:
+        granularity = Granularity.MICRO_SPAN
+    else:
+        granularity = Granularity.STANDARD
+
+ADDED static method _dedupe_by_text(chunks):
+    Drops chunks whose normalized whitespace+lowercase text duplicates one
+    already kept. Chunks arrive sorted by descending similarity, so the highest
+    scoring occurrence is retained.
+
+ADDED call in Step 2, after the granularity fallback search:
+    candidate_chunks = self._dedupe_by_text(candidate_chunks)
+
+-------------------------------------------------------------------------------
+2.3  src/pruning/gradient_pruner.py
+-------------------------------------------------------------------------------
+
+CHANGED Tier 3 max bound — BEFORE:  min_k, max_k = 3, 6
+                          AFTER:   min_k, max_k = 3, 5
+    (bounded by the baseline's fixed k=5 so QATM can never retain more chunks
+     than the pipeline it is compared against)
+
+ADDED step 2b, after the cliff cutoff loop:
+    is_flat = bool(deltas) and max(deltas) < self.gradient_threshold
+    if tier == QueryTier.TIER_3_COMPLEX and is_flat:
+        cutoff_k = max(cutoff_k, max_k)
+
+    Rationale: a flat curve means evidence is spread evenly rather than
+    concentrated behind one knee. For complex (multi-hop) queries that means
+    WIDEN, not clamp.
+
+CHANGED log line to include ", Flat: {is_flat}"
+
+CHANGED strategy_used field:
+    "flat_widened" if (Tier 3 and is_flat) else "gradient_knee_tier_constrained"
+
+-------------------------------------------------------------------------------
+2.4  src/prompting/token_budget.py
+-------------------------------------------------------------------------------
+
+CHANGED tier_caps:
+    TIER_3_COMPLEX: 1800  ->  1200
+
+-------------------------------------------------------------------------------
+2.5  src/evaluation/evaluator.py
+-------------------------------------------------------------------------------
+
+ADDED method _llm_status():
+    Reads llm_provider.is_real_llm / .provider_name from the baseline pipeline.
+    Logs a WARNING when running the extractive fallback.
+    Returns {backend, is_real_llm, metrics_valid}.
+
+ADDED warm-up before the measured loop in evaluate_dataset():
+    llm = getattr(self.baseline, "llm_provider", None)
+    warmed = False
+    if llm is not None and hasattr(llm, "warm_up"):
+        warmed = llm.warm_up()
+
+CHANGED report summary to include:
+    "llm_status": {**self._llm_status(), "warmed_up": warmed}
+
+-------------------------------------------------------------------------------
+2.6  configs/default_config.yaml
+-------------------------------------------------------------------------------
+
+ADDED under llm:
+    ollama_host: "http://localhost:11434"
+    ollama_model: "llama3.2"
+    prefer_ollama: false
+
+-------------------------------------------------------------------------------
+2.7  configs/qatm.yaml  (tier_3 block)
+-------------------------------------------------------------------------------
+
+CHANGED:
+    target_tokens:         1200 -> 900
+    min_tokens:            700  -> 400
+    max_tokens:            1800 -> 1200
+    retrieval_granularity: parent_block -> standard
+    max_items:             6    -> 5
+
+-------------------------------------------------------------------------------
+2.8  Entry point config wiring (run_baseline.py, run_qatm.py, run_benchmark.py,
+     app/main.py)
+-------------------------------------------------------------------------------
+
+BEFORE (all four files):
+    llm = LlamaCppProvider()
+
+AFTER:
+    llm = LlamaCppProvider(
+        model_path=cfg.get("llm.model_path"),
+        ollama_model=cfg.get("llm.ollama_model"),
+        ollama_host=cfg.get("llm.ollama_host"),
+        prefer_ollama=cfg.get("llm.prefer_ollama", False)
+    )
+    (in app/main.py the prefix is self.cfg.get(...) instead of cfg.get(...))
+
+ALSO in app/main.py — /api/health response:
+    OLD: "llm_provider": getattr(s.llm, "provider_name", "Llama-3.2-3B (cpp/fallback)")
+    NEW: "llm_provider": getattr(s.llm, "provider_name", "unknown"),
+         "llm_is_real": getattr(s.llm, "is_real_llm", False)
+
+-------------------------------------------------------------------------------
+2.9  tests/unit/test_pruning.py — 3 tests added
+-------------------------------------------------------------------------------
+
+    test_tier3_cap_keeps_token_savings_possible()
+        Flat high-confidence 15-chunk pool -> asserts Tier 3 retains <= 5.
+
+    test_tier3_flat_distribution_widens()
+        Flat curve (max delta ~0.01) -> asserts strategy == "flat_widened"
+        and retained == 5.
+
+    test_cliff_still_truncates_for_tier3()
+        Genuine cliff -> asserts strategy == "gradient_knee_tier_constrained"
+        and retained == 3 (the cliff still truncates).
+
+
+===============================================================================
+SECTION 3 — HOW TO REPRODUCE FROM SCRATCH (FUTURE USE)
+===============================================================================
+
+PREREQUISITE: Ollama installed and running (default http://localhost:11434).
+
+-------------------------------------------------------------------------------
+STEP 1 — Install Python dependencies
+-------------------------------------------------------------------------------
+    cd "D:\3 rd year\EDI"
+    pip install -r requirements.txt
+
+    FIXED 2026-09-18: requirements.txt previously omitted fastapi / uvicorn /
+    python-multipart / httpx even though app/main.py and tests/unit/test_app.py
+    need them. They are now declared. No extra install step required.
+
+-------------------------------------------------------------------------------
+STEP 2 — Pull the local model (one time, ~2 GB download)
+-------------------------------------------------------------------------------
+    ollama pull llama3.2
+
+    Verify:
+    ollama list
+    # should show: llama3.2:latest
+
+-------------------------------------------------------------------------------
+STEP 3 — Run unit tests
+-------------------------------------------------------------------------------
+    python -m pytest tests/unit -v
+    # EXPECT: 9 passed
+
+-------------------------------------------------------------------------------
+STEP 4 — Run the comparative benchmark
+-------------------------------------------------------------------------------
+    python run_benchmark.py --dataset data/evaluation/eval_dataset.json --doc ieee_project_dynamic_rag_architecture.md
+
+    LOOK FOR in the output:
+      - "Using Ollama backend at 'http://localhost:11434' with model 'llama3.2:latest'"
+      - "Warm-up complete in ... ms"
+      - Mean Token Savings (%) on the QATM column POSITIVE
+
+    NOTE: PowerShell may report exit code 1 because the embedding model writes a
+    progress bar to stderr. The run still completes and still writes the report.
+    This is cosmetic.
+
+-------------------------------------------------------------------------------
+STEP 5 — Confirm the results are VALID (most important step)
+-------------------------------------------------------------------------------
+    (Get-Content results\benchmark_report.json -Raw | ConvertFrom-Json).summary.llm_status
+
+    REQUIRED:
+        is_real_llm   = True
+        metrics_valid = True      <-- if False, no LLM ran; numbers are invalid
+        warmed_up     = True      <-- if False, latency is cold-start skewed
+
+-------------------------------------------------------------------------------
+STEP 6 — Launch the web dashboard
+-------------------------------------------------------------------------------
+    python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+    Then open  http://127.0.0.1:8000  in a browser.
+    First startup takes 30-60s (loads embedding model + auto-indexes default doc).
+    Ctrl+C to stop.
+
+    Endpoints:
+        GET  /              -> dashboard HTML
+        GET  /api/health    -> status + llm_provider + llm_is_real
+        POST /api/query     -> side-by-side baseline vs QATM
+        POST /api/benchmark -> full benchmark run
+        POST /api/ingest    -> upload/point at a document to index
+
+-------------------------------------------------------------------------------
+STEP 7 (alternative) — Run individual pipelines
+-------------------------------------------------------------------------------
+    python run_baseline.py --dataset data/evaluation/eval_dataset.json --doc ieee_project_dynamic_rag_architecture.md
+    python run_qatm.py     --dataset data/evaluation/eval_dataset.json --doc ieee_project_dynamic_rag_architecture.md
+
+
+===============================================================================
+SECTION 4 — VERIFICATION CHECKLIST
+===============================================================================
+
+    [ ] pip install -r requirements.txt  (+ fastapi uvicorn httpx python-multipart)
+    [ ] ollama list  shows llama3.2:latest
+    [ ] python -m pytest tests/unit -v  =>  9 passed
+    [ ] run_benchmark.py logs "Using Ollama backend ..."
+    [ ] run_benchmark.py logs "Warm-up complete"
+    [ ] benchmark_report.json -> summary.llm_status.metrics_valid == true
+    [ ] benchmark_report.json -> summary.llm_status.warmed_up == true
+    [ ] QATM Mean Token Savings (%) is POSITIVE
+    [ ] uvicorn starts; http://127.0.0.1:8000 loads the dashboard
+    [ ] /api/health returns "llm_is_real": true
+
+    If metrics_valid is false: Ollama is not running or llama3.2 is not pulled.
+    Re-run `ollama pull llama3.2` and confirm `ollama list`.
+
+
+===============================================================================
+SECTION 5 — TROUBLESHOOTING
+===============================================================================
+
+SYMPTOM: Benchmark says "Operating in deterministic extractive fallback mode"
+CAUSE  : Ollama not reachable, or model not pulled.
+FIX    : Start Ollama. Run `ollama list`. If empty: `ollama pull llama3.2`.
+         Check the host/port in configs/default_config.yaml (llm.ollama_host).
+
+SYMPTOM: Benchmark says "Ollama is reachable but model 'X' is not pulled"
+CAUSE  : Config model name != installed model name.
+FIX    : `ollama list` to see exact names, then set llm.ollama_model to match.
+         (Matching ignores the ":latest" suffix automatically.)
+
+SYMPTOM: First query takes 60+ seconds
+CAUSE  : Model cold-start (loading weights into memory).
+FIX    : Already handled — warm_up() runs before measurement. If it still
+         skews, confirm summary.llm_status.warmed_up == true.
+
+SYMPTOM: PowerShell reports exit code 1 but the report was written
+CAUSE  : Embedding model progress bar on stderr.
+FIX    : Cosmetic. Ignore, or redirect with 2>$null.
+
+SYMPTOM: Token savings are negative again
+CAUSE  : Tier 3 granularity reverted to PARENT_BLOCK, or max_k raised above 5.
+FIX    : In qatm_pipeline.py, Tier 3 must use Granularity.STANDARD.
+         In gradient_pruner.py, Tier 3 max_k must be 5, not 6.
+
+SYMPTOM: /api/query returns "Information not found in context." for BOTH pipelines
+CAUSE  : NOT a bug. The question is not answerable from the indexed document.
+         Observed on q6 — both baseline and QATM fail identically because the
+         source doc does not explain the asked relationship.
+FIX    : Use a corpus that actually contains the answer.
+
+SYMPTOM: uvicorn exits immediately with no output
+CAUSE  : Possibly port 8000 already in use.
+FIX    : Try another port: --port 8001. Check with:
+         Test-NetConnection -ComputerName 127.0.0.1 -Port 8000
+
+
+===============================================================================
+SECTION 6 — KNOWN CAVEATS BEFORE PUBLISHING (READ THIS)
+===============================================================================
+
+  1. THE EVAL SET IS TINY. 6 queries on 1 document. This cannot support a
+     publication claim. Needed: HotpotQA / SQuAD / MS-MARCO subsets.
+
+  2. LATENCY SIGNAL IS WEAK. Mean latency improved only -7.9%, and P95 was
+     slightly WORSE (+2.1%). With 6 short queries the difference is within
+     noise. Token savings (-20.5%) are the consistent, defensible result.
+
+  3. NO ANSWER-QUALITY METRIC EXISTS. The framework measures COST only
+     (tokens, latency, depth). It does NOT measure whether accuracy is
+     preserved. Ragas is mentioned in docs but is NOT implemented and NOT in
+     requirements.txt. Until faithfulness / EM / F1 exists, results should be
+     reported as cost reductions only, NOT as "no accuracy loss".
+
+  4. THE INDEXED DOCUMENT IS THE PROJECT'S OWN PROPOSAL. It contains the paper's
+     EXPECTED results table, so generated answers can quote those expected
+     figures as if they were findings (this happens on q5). Use a NEUTRAL corpus
+     for final measurements.
+
+  5. ONLY TESTED ON CPU EMBEDDINGS. configs/default_config.yaml says
+     device: "cuda" but the entry points hardcode device="cpu".
+
+  6. API SOURCE REPORTING IS COSMETIC-ONLY BUG. In app/main.py, the retrieved
+     chunk "text" field returns the document NAME rather than the chunk text
+     (the dict comprehension reuses variable "s" for both the state object and
+     the source dict). Fix before any demo of the dashboard.
+
+
+===============================================================================
+SECTION 7 — WHAT TO DO NEXT (PRIORITY ORDER)
+===============================================================================
+
+  1. Expand the eval set (HotpotQA / SQuAD / MS-MARCO) on a NEUTRAL corpus.
+     This is the single biggest blocker.
+  2. Add an answer-quality metric (Ragas or EM/F1) so "quality preserved" is
+     provable, not assumed.
+  3. Add scripts/generate_plots.py for paper figures.
+  4. Add the remaining unit tests (indexing, embeddings, ingestion, trimming,
+     prompting, retrieval) and an integration test.
+
+DONE 2026-09-18:
+  - fastapi / uvicorn / python-multipart / httpx added to requirements.txt.
+
+===============================================================================
+END OF FILE
+===============================================================================

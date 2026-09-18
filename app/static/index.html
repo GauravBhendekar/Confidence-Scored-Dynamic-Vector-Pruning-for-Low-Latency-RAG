@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QATM-RAG | Low-Latency RAG Research Dashboard</title>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div class="glow-bg"></div>
+
+    <!-- Main App Container -->
+    <div class="app-wrapper">
+
+        <!-- Header -->
+        <header class="app-header">
+            <div class="brand">
+                <div class="logo-icon">
+                    <i class="fa-solid fa-bolt-lightning"></i>
+                </div>
+                <div class="brand-text">
+                    <h1>QATM-RAG <span>Research Studio</span></h1>
+                    <p class="subtitle">Query-Adaptive Token-Minimizing Retrieval-Augmented Generation</p>
+                </div>
+            </div>
+
+            <!-- Health Status Pill -->
+            <div class="status-pill" id="statusPill">
+                <span class="status-dot pulsing"></span>
+                <span id="statusText">Connecting...</span>
+            </div>
+        </header>
+
+        <!-- Top Control & Document Bar -->
+        <section class="control-bar glass-card">
+            <div class="doc-info">
+                <div class="icon-box"><i class="fa-solid fa-file-contract"></i></div>
+                <div>
+                    <div class="label">Active Document</div>
+                    <div class="doc-name" id="activeDocName">ieee_project_dynamic_rag_architecture.md</div>
+                </div>
+            </div>
+
+            <div class="system-stats">
+                <div class="stat-badge">
+                    <span class="stat-value" id="indexedChunks">--</span>
+                    <span class="stat-label">Indexed Chunks</span>
+                </div>
+                <div class="stat-badge">
+                    <span class="stat-value" id="embeddingModel">bge-small-en-v1.5</span>
+                    <span class="stat-label">Embedding Model</span>
+                </div>
+            </div>
+
+            <div class="action-buttons">
+                <label for="docUpload" class="btn btn-secondary">
+                    <i class="fa-solid fa-cloud-arrow-up"></i> Upload Doc
+                    <input type="file" id="docUpload" accept=".md,.pdf,.txt" style="display: none;">
+                </label>
+                <button id="runBenchmarkBtn" class="btn btn-outline">
+                    <i class="fa-solid fa-chart-line"></i> Run Benchmark Suite
+                </button>
+            </div>
+        </section>
+
+        <!-- Query Input Section -->
+        <section class="query-section glass-card">
+            <div class="search-box">
+                <i class="fa-solid fa-magnifying-glass search-icon"></i>
+                <input type="text" id="queryInput" placeholder="Ask a question (e.g., 'What is the core goal of dynamic pruning?')" value="What is the core goal of dynamic vector pruning in QATM-RAG?">
+                <button id="submitQueryBtn" class="btn btn-primary">
+                    <span>Execute Pipeline</span>
+                    <i class="fa-solid fa-paper-plane"></i>
+                </button>
+            </div>
+            
+            <div class="preset-pills">
+                <span class="preset-label">Preset Queries:</span>
+                <button class="pill-btn" data-query="What is the project title?">Factoid: Project Title</button>
+                <button class="pill-btn" data-query="How does dynamic score gradient pruning work?">Descriptive: Gradient Pruning</button>
+                <button class="pill-btn" data-query="Explain how multi-granularity document indexer coordinates Level 1, 2, and 3 chunks for token optimization.">Complex: Multi-Scale Chunker</button>
+            </div>
+        </section>
+
+        <!-- Execution Progress Loader -->
+        <div id="loader" class="loader-container hidden">
+            <div class="spinner"></div>
+            <p>Classifying Query Tier, Scoring Similarity Gradients & Pruning Context...</p>
+        </div>
+
+        <!-- Side-by-Side Comparison Workspace -->
+        <main id="comparisonWorkspace" class="comparison-grid">
+
+            <!-- Baseline RAG Card -->
+            <div class="card glass-card baseline-card">
+                <div class="card-header">
+                    <div class="title-badge baseline-badge">
+                        <i class="fa-solid fa-cube"></i> Standard Baseline RAG (Top-K=5)
+                    </div>
+                    <span class="tokens-tag" id="bTokens">-- Tokens</span>
+                </div>
+
+                <div class="card-body">
+                    <div class="metric-row">
+                        <div class="metric">
+                            <span class="val" id="bChunks">5</span>
+                            <span class="lbl">Retrieved Chunks</span>
+                        </div>
+                        <div class="metric">
+                            <span class="val" id="bLatency">-- ms</span>
+                            <span class="lbl">Total Latency</span>
+                        </div>
+                        <div class="metric">
+                            <span class="val">0%</span>
+                            <span class="lbl">Token Reduction</span>
+                        </div>
+                    </div>
+
+                    <div class="section-title">LLM Generated Response</div>
+                    <div class="response-box" id="bAnswer">
+                        <em>Run a query to view baseline response output...</em>
+                    </div>
+
+                    <div class="section-title">Retrieved Chunks Context</div>
+                    <div class="chunks-list" id="bChunksList">
+                        <div class="chunk-item placeholder">No context retrieved yet</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- QATM-RAG Card (Highlighted) -->
+            <div class="card glass-card qatm-card">
+                <div class="card-header">
+                    <div class="title-badge qatm-badge">
+                        <i class="fa-solid fa-bolt"></i> QATM-RAG Engine (Dynamic Pruning)
+                    </div>
+                    <div class="badges-group">
+                        <span class="tier-tag" id="qTier">Tier --</span>
+                        <span class="savings-tag" id="qSavingsBadge">--% Saved</span>
+                    </div>
+                </div>
+
+                <div class="card-body">
+                    <div class="metric-row highlighted-row">
+                        <div class="metric">
+                            <span class="val highlight-green" id="qTokens">--</span>
+                            <span class="lbl">Context Tokens</span>
+                        </div>
+                        <div class="metric">
+                            <span class="val highlight-cyan" id="qSavings">--%</span>
+                            <span class="lbl">Token Savings</span>
+                        </div>
+                        <div class="metric">
+                            <span class="val highlight-purple" id="qLatency">-- ms</span>
+                            <span class="lbl">Total Latency</span>
+                        </div>
+                    </div>
+
+                    <!-- Similarity Dropoff Visualizer -->
+                    <div class="section-title">Score Gradient Drop-Off Curvature ($\Delta_i$)</div>
+                    <div class="gradient-visualizer" id="gradientChart">
+                        <div class="empty-chart">Score drop-off curve rendered on query run</div>
+                    </div>
+
+                    <div class="section-title">LLM Generated Response (Noise-Free)</div>
+                    <div class="response-box qatm-response" id="qAnswer">
+                        <em>Run a query to view QATM dynamic pruned output...</em>
+                    </div>
+
+                    <div class="section-title">Optimal Pruned Context Chunks</div>
+                    <div class="chunks-list" id="qChunksList">
+                        <div class="chunk-item placeholder">No context retrieved yet</div>
+                    </div>
+                </div>
+            </div>
+
+        </main>
+
+        <!-- Benchmark Report Modal / Drawer -->
+        <section id="benchmarkSection" class="glass-card benchmark-card hidden">
+            <div class="benchmark-header">
+                <h2><i class="fa-solid fa-chart-column"></i> Benchmark Suite Summary Report</h2>
+                <button id="closeBenchmarkBtn" class="icon-btn"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+
+            <div class="benchmark-kpis" id="benchmarkKpis">
+                <!-- Dynamically populated -->
+            </div>
+
+            <div class="table-container">
+                <table class="benchmark-table">
+                    <thead>
+                        <tr>
+                            <th>Metric</th>
+                            <th>Baseline RAG (Top-K=5)</th>
+                            <th>QATM-RAG (Dynamic)</th>
+                            <th>Improvement Delta</th>
+                        </tr>
+                    </thead>
+                    <tbody id="benchmarkTableBody">
+                        <!-- Dynamically populated -->
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

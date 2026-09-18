@@ -1,0 +1,3 @@
+# Keeps the results/ directory in version control while ignoring generated
+# reports. Regenerate the benchmark report with:
+#   python run_benchmark.py --dataset data/evaluation/eval_dataset.json --doc ieee_project_dynamic_rag_architecture.md

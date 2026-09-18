@@ -1,0 +1,17 @@
+pipeline: "baseline"
+
+retrieval:
+  top_k: 5
+  granularity: "standard" # standard paragraphs
+
+pruning:
+  enabled: false
+
+classification:
+  enabled: false
+
+trimming:
+  enabled: false
+
+budget:
+  enabled: false

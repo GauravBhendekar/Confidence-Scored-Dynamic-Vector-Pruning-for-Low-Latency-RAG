@@ -1,0 +1,32 @@
+[
+  {
+    "id": "q1",
+    "question": "What is the core goal of the dynamic vector pruning project?",
+    "expected_tier": 1
+  },
+  {
+    "id": "q2",
+    "question": "Who developed the Adaptive-RAG framework?",
+    "expected_tier": 1
+  },
+  {
+    "id": "q3",
+    "question": "How does the score gradient delta calculation identify knee-points in retrieval?",
+    "expected_tier": 2
+  },
+  {
+    "id": "q4",
+    "question": "Explain the hierarchical parent-child chunking strategy and its benefit.",
+    "expected_tier": 2
+  },
+  {
+    "id": "q5",
+    "question": "Compare standard naive RAG with fixed k=5 against proposed QATM-RAG across latency and token savings.",
+    "expected_tier": 3
+  },
+  {
+    "id": "q6",
+    "question": "Synthesize the relationship between query complexity classification, retrieval depth, and context token budgets.",
+    "expected_tier": 3
+  }
+]
